@@ -6,6 +6,8 @@ the runner module is loaded from its path.
 
 import importlib.util
 import math
+import multiprocessing
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +91,55 @@ class _AlternatingActionApproach:
     def step(self) -> Any:
         """Return the action whose magnitude sets the episode length."""
         action = 0.5 if self._reset_count % 2 else 0.25
+        return np.array([action], dtype=np.float32)
+
+    def update(self, state: Any, reward: float, done: bool, info: Any) -> None:
+        """Record the outcome, matching the BaseApproach interface."""
+        del state, reward, done, info
+
+
+class _CrashOnSecondResetApproach:
+    """Plays one normal replay, then raises on every step of the next."""
+
+    def __init__(self) -> None:
+        self._reset_count = 0
+
+    def reset(self, state: Any, info: Any) -> None:
+        """Count resets so only the second replay crashes."""
+        del state, info
+        self._reset_count += 1
+
+    def step(self) -> Any:
+        """Solve normally on the first replay, crash on the second."""
+        if self._reset_count > 1:
+            raise RuntimeError("policy exploded on the replayed seed")
+        return np.array([0.5], dtype=np.float32)
+
+    def update(self, state: Any, reward: float, done: bool, info: Any) -> None:
+        """Record the outcome, matching the BaseApproach interface."""
+        del state, reward, done, info
+
+
+class _SharedCounterApproach:
+    """Length varies across resets through a fork-shared multiprocessing counter.
+
+    Each forked worker inherits the counter's current value, and the worker-side
+    reset bumps it, so the parent-side counter advance between replays makes the
+    two replays take deliberately different step counts without randomness.
+    """
+
+    def __init__(self, counter: "multiprocessing.Value") -> None:
+        self._counter = counter
+
+    def reset(self, state: Any, info: Any) -> None:
+        """Bump the shared counter so the episode length flips each replay."""
+        del state, info
+        with self._counter.get_lock():
+            self._counter.value += 1
+
+    def step(self) -> Any:
+        """Return the action whose magnitude sets the episode length."""
+        action = 0.5 if self._counter.value % 2 else 0.25
         return np.array([action], dtype=np.float32)
 
     def update(self, state: Any, reward: float, done: bool, info: Any) -> None:
@@ -276,3 +327,54 @@ def test_invalid_experiment_id_is_rejected(condition_id: str) -> None:
     cfg = OmegaConf.create({"experiment_id": condition_id})
     with pytest.raises(ValueError, match="tracker-generated"):
         run_experiment.resolve_experiment_id(cfg)
+
+
+def test_determinism_check_survives_a_crashing_replay() -> None:
+    """A policy crash on a replayed seed is recorded, not fatal to the run."""
+    env = _IncrementEnv()
+    approach = _CrashOnSecondResetApproach()
+    result = run_experiment.run_determinism_check(
+        env,
+        approach,
+        [10],
+        num_episodes=1,
+        max_steps=100,
+        timeout=30,
+    )
+    assert result["determinism_check_num_episodes"] == 1
+    first = result["determinism_check"]["episodes"][0]
+    assert first["num_steps"] is not None
+    assert first["replay2_num_steps"] is None
+    assert first["replay2_solved"] is False
+    assert first["agrees"] is False
+    assert result["determinism_check_agreement_rate"] == 0.0
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="forked workers are disabled on darwin",
+)
+def test_determinism_check_covers_the_forked_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The checker reports disagreement through real forked workers.
+
+    A shared multiprocessing counter makes the two replays take deliberately
+    different lengths: each forked child inherits the counter, its reset bumps
+    it, and the step action reads the bumped value, so replay one is short and
+    replay two is long without relying on random outcomes or wall clock.
+    """
+    monkeypatch.setattr("robocode.utils.episode._EPISODE_FORK_SAFE", True)
+    counter = multiprocessing.Value("i", 0)
+    env = _IncrementEnv()
+    approach = _SharedCounterApproach(counter)
+    result = run_experiment.run_determinism_check(
+        env,
+        approach,
+        [10],
+        num_episodes=1,
+        max_steps=100,
+        timeout=30,
+    )
+    first = result["determinism_check"]["episodes"][0]
+    assert first["num_steps"] != first["replay2_num_steps"]
+    assert first["agrees"] is False
+    assert result["determinism_check_agreement_rate"] == 0.0

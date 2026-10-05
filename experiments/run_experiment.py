@@ -124,12 +124,33 @@ def run_determinism_check(
             if count is not None and isinstance(env, VariableCountEnv)
             else max_steps
         )
-        first, _, _ = run_episode_with_timeout(
-            env, approach, seed, episode_max_steps, timeout=timeout, count=count
-        )
-        second, _, _ = run_episode_with_timeout(
-            env, approach, seed, episode_max_steps, timeout=timeout, count=count
-        )
+        first: dict[str, Any]
+        second: dict[str, Any]
+        for attempt in range(2):
+            try:
+                metrics, _, _ = run_episode_with_timeout(
+                    env, approach, seed, episode_max_steps, timeout=timeout, count=count
+                )
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                # A loaded policy can raise on a replayed seed. Record the crash as
+                # that replay's outcome so the check never aborts the completed
+                # evaluation before results.json is written.
+                logger.exception(
+                    "Determinism replay %d for seed %d crashed; recorded as failed",
+                    attempt + 1,
+                    seed,
+                )
+                metrics = {
+                    "total_reward": None,
+                    "num_steps": None,
+                    "solved": False,
+                    "crashed": True,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            if attempt == 0:
+                first = metrics
+            else:
+                second = metrics
         pairs.append((first, second))
     summary = summarize_determinism_replays(pairs)
     return {
