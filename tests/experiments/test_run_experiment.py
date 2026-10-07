@@ -8,6 +8,7 @@ import importlib.util
 import math
 import multiprocessing
 import sys
+from multiprocessing.sharedctypes import Synchronized
 from pathlib import Path
 from typing import Any
 
@@ -128,7 +129,7 @@ class _SharedCounterApproach:
     two replays take deliberately different step counts without randomness.
     """
 
-    def __init__(self, counter: "multiprocessing.Value") -> None:
+    def __init__(self, counter: "Synchronized[int]") -> None:
         self._counter = counter
 
     def reset(self, state: Any, info: Any) -> None:
@@ -354,7 +355,7 @@ def test_determinism_check_survives_a_crashing_replay() -> None:
     sys.platform == "darwin",
     reason="forked workers are disabled on darwin",
 )
-def test_determinism_check_covers_the_forked_path(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_determinism_check_covers_forked_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """The checker reports disagreement through real forked workers.
 
     A shared multiprocessing counter makes the two replays take deliberately
